@@ -1,5 +1,13 @@
 """问题二：含预测误差与紧急购电的全年日前储能调度。
 
+默认的 ``historical`` 信息模式严格遵守日前信息集：每日 0:00 只使用此前日期的
+历史数据预测当天负载和光伏，计划一经求得，在当天不再重新优化。``ideal_reference``
+模式仅供论文中的完全信息理想参照，直接使用当天实际曲线，绝不可作为正式结果。
+
+功率变量均为电池交流侧/微网侧 kW：充电 C 是输入电池前的功率，放电 D 是电池
+对微网输出的功率。因此 SOC 递推统一为 S[t+1]=S[t]+eta*C*DT-D*DT/eta；所有
+导出的“量”均由 kW 乘 DT=1/6 h 转换为 kWh。
+
 运行：python question2.py
 依赖：numpy、pandas、pulp、openpyxl。输入文件默认与本脚本同目录。
 """
@@ -17,6 +25,7 @@ ETA_C = ETA_D = 0.90
 S0 = 6000.0
 RISK_QUANTILE = 0.90
 WEEKDAY_SAMPLES = 4
+INFORMATION_MODE = "historical"  # 正式结果：仅使用决策时刻已知信息
 START, END = pd.Timestamp("2025-02-01"), pd.Timestamp("2025-12-31")
 ROOT = Path(__file__).resolve().parent
 ATTACH1, ATTACH2, OUTPUT = ROOT / "附件1.xlsx", ROOT / "附件2.xlsx", ROOT / "result2.xlsx"
@@ -90,6 +99,17 @@ def forecast_and_risk(day: pd.Timestamp, load: pd.DataFrame, pv: pd.DataFrame,
     return lhat, phat, risk
 
 
+def day_ahead_inputs(day: pd.Timestamp, load: pd.DataFrame, pv: pd.DataFrame,
+                     alpha: float, quantile: float, information_mode: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """返回该日 0:00 可用于制定计划的输入；理想参照模式明确隔离。"""
+    if information_mode == "historical":
+        return forecast_and_risk(day, load, pv, alpha, quantile)
+    if information_mode == "ideal_reference":
+        # 仅用于量化“完全知道未来”的理论下界，不能替代正式日前策略。
+        return load.loc[day].to_numpy(float), pv.loc[day].to_numpy(float), np.zeros(T)
+    raise ValueError("information_mode 仅支持 'historical' 或 'ideal_reference'")
+
+
 def solve_day(price: np.ndarray, lhat: np.ndarray, phat: np.ndarray, risk: np.ndarray, s_initial: float) -> DayPlan:
     """风险变量约束化的日前 MILP；E_plan 是无成本的计划弃电/备用松弛量。"""
     m = pulp.LpProblem("Q2_Risk_Aware_Day_Ahead", pulp.LpMinimize)
@@ -150,6 +170,8 @@ def validate(detail: pd.DataFrame) -> None:
     checks = [
         (balance <= tol, f"实际功率平衡残差={balance}"),
         ((detail.soc_start >= E_LO-tol).all() and (detail.soc_end <= E_HI+tol).all(), "SOC越界"),
+        (((detail.soc_end - detail.soc_start - ETA_C * detail.executed_charge_kw * DT
+           + detail.executed_discharge_kw * DT / ETA_D).abs().max() <= tol), "SOC能量递推残差超限"),
         ((detail.executed_charge_kw <= P_MAX+tol).all() and (detail.executed_discharge_kw <= P_MAX+tol).all(), "充放电功率越界"),
         (((detail.executed_charge_kw * detail.executed_discharge_kw) <= tol).all(), "执行侧充放电互斥被破坏"),
         ((detail.emergency_purchase_kw >= -tol).all(), "紧急购电出现负值"),
@@ -198,14 +220,17 @@ def export_result(detail: pd.DataFrame, output: Path) -> None:
         emergency.to_excel(writer, sheet_name="紧急购电量", index=False)
 
 
-def run(alpha: float = 1.0, quantile: float = RISK_QUANTILE, output: Path = OUTPUT) -> pd.DataFrame:
+def run(alpha: float = 1.0, quantile: float = RISK_QUANTILE, output: Path = OUTPUT,
+        information_mode: str = INFORMATION_MODE) -> pd.DataFrame:
+    """逐日滚动执行；每一天只求解一次，执行阶段不按实时偏差修改当日计划。"""
     price, load, pv = load_data(ATTACH1, ATTACH2)
     operating_days = pd.date_range(START, END, freq="D")
     print(f"电价点数：{len(price)}，负载日期数：{len(load)}，光伏日期数：{len(pv)}")
     print(f"运行区间：{START.date()} ~ {END.date()}，共 {len(operating_days)} 天")
+    print(f"信息模式：{information_mode}（{'正式日前回测' if information_mode == 'historical' else '完全信息理想参照，非正式结果'}）")
     all_days, soc = [], S0
     for day in operating_days:
-        lhat, phat, risk = forecast_and_risk(day, load, pv, alpha, quantile)
+        lhat, phat, risk = day_ahead_inputs(day, load, pv, alpha, quantile, information_mode)
         plan = solve_day(price, lhat, phat, risk, soc)
         daily, soc = execute_day(plan, load.loc[day].to_numpy(float), pv.loc[day].to_numpy(float), price, day, risk)
         daily["load_forecast"], daily["pv_forecast"] = lhat, phat
